@@ -191,14 +191,14 @@ def generate_default_arguments(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def generate_fallback_plan(body: dict[str, Any]) -> dict[str, Any]:
-    incident = body["incident"]
-    policy = body["policy"]
-    catalog = body["toolCatalog"]
+    incident = body.get("incident", {})
+    policy = body.get("policy", {})
+    catalog = body.get("toolCatalog", [])
     
-    allowed_causes = incident["allowedRootCauses"]
+    allowed_causes = incident.get("allowedRootCauses", ["unknown"])
     root_cause = allowed_causes[0] if allowed_causes else "unknown"
     
-    transcript = incident["transcript"]
+    transcript = incident.get("transcript", "")
     evidence_matches = EVIDENCE_PATTERN.findall(transcript)
     evidence = evidence_matches[:2] if len(evidence_matches) >= 2 else (evidence_matches or ["ev_placeholder"])
     if len(evidence) < 2:
@@ -218,7 +218,7 @@ def generate_fallback_plan(body: dict[str, Any]) -> dict[str, Any]:
         diag_tools = list(tools.keys())
     
     maximum = policy.get("maximumDiagnostics", 1)
-    num_diag = min(max(1, maximum), 3, len(diag_tools))
+    num_diag = min(max(1, maximum), 3, len(diag_tools)) if diag_tools else 1
     chosen_diags = diag_tools[:num_diag]
     
     diagnostics = []
@@ -361,16 +361,16 @@ def assert_no_sensitive_data(value: Any, forbidden: set[str]) -> None:
 def validate_plan(
     body: dict[str, Any], plan: dict[str, Any]
 ) -> tuple[str, list[str], list[dict[str, Any]], str | None, dict[str, Any]]:
-    incident = body["incident"]
-    policy = body["policy"]
-    catalog = body["toolCatalog"]
+    incident = body.get("incident", {})
+    policy = body.get("policy", {})
+    catalog = body.get("toolCatalog", [])
     tools = {tool["name"]: tool for tool in catalog if isinstance(tool, dict) and isinstance(tool.get("name"), str)}
-    allowed_causes = incident["allowedRootCauses"]
+    allowed_causes = incident.get("allowedRootCauses", [])
     root_cause = plan.get("rootCause")
     if not isinstance(root_cause, str) or root_cause not in allowed_causes:
         raise HTTPException(status_code=422, detail="Model selected an unsupported root cause.")
 
-    transcript = incident["transcript"]
+    transcript = incident.get("transcript", "")
     transcript_evidence = set(EVIDENCE_PATTERN.findall(transcript))
     evidence = plan.get("evidence")
     if (
@@ -385,7 +385,7 @@ def validate_plan(
     ):
         raise HTTPException(status_code=422, detail="Model selected invalid incident evidence.")
 
-    maximum = policy["maximumDiagnostics"]
+    maximum = policy.get("maximumDiagnostics", 1)
     if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 1:
         raise HTTPException(status_code=422, detail="Invalid diagnostic policy.")
     effect_names = policy.get("effectTools", [])
@@ -448,16 +448,20 @@ def validate_plan(
 
 
 def validate_incident_request(body: dict[str, Any]) -> None:
-    incident = body["incident"]
-    policy = body["policy"]
-    catalog = body["toolCatalog"]
-    causes = incident["allowedRootCauses"]
+    incident = body.get("incident")
+    policy = body.get("policy")
+    catalog = body.get("toolCatalog")
+    if not isinstance(incident, dict) or not isinstance(policy, dict) or not isinstance(catalog, list):
+        raise HTTPException(status_code=422, detail="Invalid incident request.")
+    causes = incident.get("allowedRootCauses")
     maximum = policy.get("maximumDiagnostics")
     effect_tools = policy.get("effectTools", [])
     approval_required = policy.get("approvalRequiredFor", [])
     do_not_export = policy.get("doNotExport", [])
     if (
-        any(not isinstance(cause, str) or not cause for cause in causes)
+        not isinstance(causes, list)
+        or not causes
+        or any(not isinstance(cause, str) or not cause for cause in causes)
         or not isinstance(maximum, int)
         or isinstance(maximum, bool)
         or maximum < 1
@@ -652,13 +656,11 @@ async def create_incident(request: Request):
         not isinstance(run_id, str) or not run_id
         or not isinstance(public_marker, str) or not public_marker
         or not isinstance(incident, dict)
-        or not isinstance(incident.get("transcript"), str)
-        or not isinstance(incident.get("allowedRootCauses"), list)
-        or not incident["allowedRootCauses"]
         or not isinstance(policy, dict)
         or not isinstance(catalog, list)
     ):
         raise HTTPException(status_code=422, detail="Invalid incident request.")
+    
     validate_incident_request(body)
     request_hash = hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
 
