@@ -10,12 +10,12 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 
-app = FastAPI()
-DB_FILE = os.environ.get("INCIDENT_DB_FILE", "incident_agent.db")
+DB_FILE = os.environ.get("INCIDENT_DB_FILE", "/tmp/incident_agent.db")
 PROFILE = "ga5-incident-agent/v2"
 MAX_RESPONSE_BYTES = 768 * 1024
 RETRYABLE_STATUS = 503
@@ -23,6 +23,58 @@ MAX_ATTEMPTS = 2
 EVIDENCE_PATTERN = re.compile(r"\bev_[A-Za-z0-9_-]+\b")
 APPROVAL_REQUIRED_TOOLS = {"rollback_deployment", "disable_feature"}
 LOGGER = logging.getLogger("incident_agent")
+
+
+def init_db() -> None:
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS runs (
+                run_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                root_cause TEXT NOT NULL,
+                evidence TEXT NOT NULL,
+                chosen_effect TEXT,
+                action_log TEXT NOT NULL,
+                receipt_log TEXT NOT NULL,
+                otlp_trace TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                initial_response TEXT NOT NULL,
+                current_response TEXT NOT NULL,
+                pending_dispatches TEXT NOT NULL,
+                pending_approval TEXT,
+                diagnostic_action_ids TEXT NOT NULL,
+                effect_action_id TEXT,
+                plan_json TEXT NOT NULL,
+                trace_state TEXT NOT NULL,
+                suppressed TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS receipt_replays (
+                run_id TEXT NOT NULL,
+                receipt_id TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                PRIMARY KEY (run_id, receipt_id),
+                FOREIGN KEY (run_id) REFERENCES runs(run_id)
+            )
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        init_db()
+    except Exception as e:
+        LOGGER.error(f"Failed to initialize database: {e}")
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 def canonical_json(value: Any) -> str:
@@ -95,49 +147,6 @@ def make_span(
 
 def trace_envelope(spans: list[dict[str, Any]]) -> dict[str, Any]:
     return {"resourceSpans": [{"scopeSpans": [{"spans": spans}]}]}
-
-
-def init_db() -> None:
-    conn = sqlite3.connect(DB_FILE)
-    try:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS runs (
-                run_id TEXT PRIMARY KEY,
-                status TEXT NOT NULL,
-                root_cause TEXT NOT NULL,
-                evidence TEXT NOT NULL,
-                chosen_effect TEXT,
-                action_log TEXT NOT NULL,
-                receipt_log TEXT NOT NULL,
-                otlp_trace TEXT NOT NULL,
-                request_hash TEXT NOT NULL,
-                initial_response TEXT NOT NULL,
-                current_response TEXT NOT NULL,
-                pending_dispatches TEXT NOT NULL,
-                pending_approval TEXT,
-                diagnostic_action_ids TEXT NOT NULL,
-                effect_action_id TEXT,
-                plan_json TEXT NOT NULL,
-                trace_state TEXT NOT NULL,
-                suppressed TEXT NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS receipt_replays (
-                run_id TEXT NOT NULL,
-                receipt_id TEXT NOT NULL,
-                request_hash TEXT NOT NULL,
-                response_json TEXT NOT NULL,
-                PRIMARY KEY (run_id, receipt_id),
-                FOREIGN KEY (run_id) REFERENCES runs(run_id)
-            )
-        """)
-        conn.commit()
-    finally:
-        conn.close()
-
-
-init_db()
 
 
 @app.get("/health")
