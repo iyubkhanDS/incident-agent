@@ -137,6 +137,11 @@ def init_db() -> None:
 init_db()
 
 
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
+
 def response_json(response: dict[str, Any]) -> str:
     serialized = canonical_json(response)
     if len(serialized.encode("utf-8")) > MAX_RESPONSE_BYTES:
