@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -20,6 +21,7 @@ RETRYABLE_STATUS = 503
 MAX_ATTEMPTS = 2
 EVIDENCE_PATTERN = re.compile(r"\bev_[A-Za-z0-9_-]+\b")
 APPROVAL_REQUIRED_TOOLS = {"rollback_deployment", "disable_feature"}
+LOGGER = logging.getLogger("incident_agent")
 
 
 def canonical_json(value: Any) -> str:
@@ -196,16 +198,50 @@ def call_model(body: dict[str, Any]) -> tuple[dict[str, Any], str]:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(
-            request, timeout=float(os.environ.get("INCIDENT_AI_TIMEOUT_SECONDS", "180"))
-        ) as result:
+        timeout_seconds = float(os.environ.get("INCIDENT_AI_TIMEOUT_SECONDS", "45"))
+        if timeout_seconds <= 0:
+            raise ValueError("timeout must be positive")
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail="Invalid model timeout configuration.") from exc
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as result:
             payload = json.loads(result.read())
+    except urllib.error.HTTPError as exc:
+        LOGGER.warning("Incident model provider returned HTTP %s.", exc.code)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Incident model provider rejected the request (HTTP {exc.code}).",
+        ) from exc
+    except (TimeoutError, urllib.error.URLError, OSError) as exc:
+        if isinstance(exc, TimeoutError) or (
+            isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, TimeoutError)
+        ):
+            LOGGER.warning("Incident model provider request timed out.")
+            raise HTTPException(
+                status_code=504,
+                detail="Incident model provider request timed out.",
+            ) from exc
+        LOGGER.warning("Incident model provider could not be reached.")
+        raise HTTPException(
+            status_code=502,
+            detail="Incident model provider could not be reached.",
+        ) from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        LOGGER.warning("Incident model provider returned invalid JSON.")
+        raise HTTPException(
+            status_code=502,
+            detail="Incident model provider returned invalid JSON.",
+        ) from exc
+    try:
         content = payload["choices"][0]["message"]["content"]
         plan = json.loads(content)
-    except urllib.error.HTTPError as exc:
-        raise HTTPException(status_code=502, detail="Incident diagnosis model request failed.") from exc
-    except (urllib.error.URLError, TimeoutError, OSError, KeyError, IndexError, TypeError, ValueError) as exc:
-        raise HTTPException(status_code=502, detail="Incident diagnosis model returned an invalid response.") from exc
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+        LOGGER.warning("Incident model provider response did not match the expected JSON shape.")
+        raise HTTPException(
+            status_code=502,
+            detail="Incident model provider response did not match the expected JSON format.",
+        ) from exc
     if not isinstance(plan, dict):
         raise HTTPException(status_code=502, detail="Incident diagnosis model returned an invalid plan.")
     return plan, model
