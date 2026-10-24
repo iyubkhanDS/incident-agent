@@ -26,8 +26,12 @@ LOGGER = logging.getLogger("incident_agent")
 
 
 def init_db() -> None:
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30.0)
     try:
+        # Enable WAL mode to support concurrent readers and writers
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        
         conn.execute("""
             CREATE TABLE IF NOT EXISTS runs (
                 run_id TEXT PRIMARY KEY,
@@ -1089,7 +1093,7 @@ async def process_receipt(runId: str, request: Request):
 
 @app.get("/v2/incidents/{runId}")
 async def get_incident_status(runId: str):
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30.0)
     try:
         row = conn.execute(
             "SELECT current_response FROM runs WHERE run_id = ?", (runId,)
