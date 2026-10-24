@@ -14,8 +14,9 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 
-DB_FILE = os.environ.get("INCIDENT_DB_FILE", "/tmp/incident_agent.db")
+DB_FILE = os.environ.get("INCIDENT_DB_FILE", "incident_agent.db")
 PROFILE = "ga5-incident-agent/v2"
 MAX_RESPONSE_BYTES = 768 * 1024
 RETRYABLE_STATUS = 503
@@ -26,12 +27,10 @@ LOGGER = logging.getLogger("incident_agent")
 
 
 def init_db() -> None:
-    conn = sqlite3.connect(DB_FILE, timeout=30.0)
+    conn = sqlite3.connect(DB_FILE, timeout=60.0)
     try:
-        # Enable WAL mode to support concurrent readers and writers
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
-        
         conn.execute("""
             CREATE TABLE IF NOT EXISTS runs (
                 run_id TEXT PRIMARY KEY,
@@ -73,8 +72,8 @@ def init_db() -> None:
 async def lifespan(app: FastAPI):
     try:
         init_db()
-    except Exception as e:
-        LOGGER.error(f"Failed to initialize database: {e}")
+    except Exception as exc:
+        LOGGER.error("Failed to initialize database: %s", exc)
     yield
 
 
@@ -174,95 +173,8 @@ def model_configuration() -> tuple[str, str, str]:
     return base_url, api_key, model
 
 
-def generate_default_arguments(schema: dict[str, Any]) -> dict[str, Any]:
-    schema_type = schema.get("type", "object")
-    if schema_type != "object":
-        return {}
-    properties = schema.get("properties", {})
-    required = schema.get("required", [])
-    args = {}
-    for prop, prop_schema in properties.items():
-        p_type = prop_schema.get("type", "string")
-        if "enum" in prop_schema and prop_schema["enum"]:
-            args[prop] = prop_schema["enum"][0]
-        elif p_type == "string":
-            args[prop] = prop_schema.get("default", "test-value")
-        elif p_type == "integer":
-            args[prop] = prop_schema.get("default", 1)
-        elif p_type == "number":
-            args[prop] = prop_schema.get("default", 1.0)
-        elif p_type == "boolean":
-            args[prop] = prop_schema.get("default", True)
-        elif p_type == "object":
-            args[prop] = generate_default_arguments(prop_schema)
-        elif p_type == "array":
-            args[prop] = []
-    for req in required:
-        if req not in args:
-            args[req] = "required-value"
-    return args
-
-
-def generate_fallback_plan(body: dict[str, Any]) -> dict[str, Any]:
-    incident = body.get("incident", {})
-    policy = body.get("policy", {})
-    catalog = body.get("toolCatalog", [])
-    
-    allowed_causes = incident.get("allowedRootCauses", ["unknown"])
-    root_cause = allowed_causes[0] if allowed_causes else "unknown"
-    
-    transcript = incident.get("transcript", "")
-    evidence_matches = EVIDENCE_PATTERN.findall(transcript)
-    evidence = evidence_matches[:2] if len(evidence_matches) >= 2 else (evidence_matches or ["ev_placeholder"])
-    if len(evidence) < 2:
-        evidence = ["ev_default_1", "ev_default_2"]
-    
-    effect_names = policy.get("effectTools", [])
-    effect_tool = effect_names[0] if effect_names else None
-    
-    tools = {tool["name"]: tool for tool in catalog if isinstance(tool, dict) and isinstance(tool.get("name"), str)}
-    diag_tools = [
-        t_name for t_name in tools
-        if t_name not in effect_names
-        and t_name not in policy.get("approvalRequiredFor", [])
-        and t_name not in APPROVAL_REQUIRED_TOOLS
-    ]
-    if not diag_tools:
-        diag_tools = list(tools.keys())
-    
-    maximum = policy.get("maximumDiagnostics", 1)
-    num_diag = min(max(1, maximum), 3, len(diag_tools)) if diag_tools else 1
-    chosen_diags = diag_tools[:num_diag]
-    
-    diagnostics = []
-    for d_name in chosen_diags:
-        tool_def = tools.get(d_name, {})
-        schema = tool_def.get("inputSchema", {})
-        diagnostics.append({
-            "toolName": d_name,
-            "arguments": generate_default_arguments(schema)
-        })
-        
-    effect_args = {}
-    if effect_tool and effect_tool in tools:
-        effect_schema = tools[effect_tool].get("inputSchema", {})
-        effect_args = generate_default_arguments(effect_schema)
-        
-    return {
-        "rootCause": root_cause,
-        "evidence": evidence[:4],
-        "diagnostics": diagnostics,
-        "effectTool": effect_tool,
-        "effectArguments": effect_args
-    }
-
-
 def call_model(body: dict[str, Any]) -> tuple[dict[str, Any], str]:
-    try:
-        base_url, api_key, model = model_configuration()
-    except HTTPException:
-        return generate_fallback_plan(body), "fallback-model"
-
+    base_url, api_key, model = model_configuration()
     safe_input = {
         key: body[key]
         for key in ("agentName", "incident", "toolCatalog", "policy")
@@ -308,14 +220,39 @@ def call_model(body: dict[str, Any]) -> tuple[dict[str, Any], str]:
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as result:
             payload = json.loads(result.read())
+    except urllib.error.HTTPError as exc:
+        error_detail = exc.read().decode("utf-8", errors="ignore")
+        LOGGER.warning("Incident model provider returned HTTP %s: %s", exc.code, error_detail)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Incident model provider rejected the request (HTTP {exc.code}).",
+        ) from exc
+    except (TimeoutError, urllib.error.URLError, OSError) as exc:
+        LOGGER.warning("Incident model provider request failed: %s", exc)
+        raise HTTPException(
+            status_code=502,
+            detail="Incident model provider could not be reached.",
+        ) from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        LOGGER.warning("Incident model provider returned invalid JSON.")
+        raise HTTPException(
+            status_code=502,
+            detail="Incident model provider returned invalid JSON.",
+        ) from exc
+
+    try:
         content = payload["choices"][0]["message"]["content"]
         plan = json.loads(content)
-        if not isinstance(plan, dict):
-            raise ValueError("Plan is not a dict")
-        return plan, model
-    except Exception as exc:
-        LOGGER.warning("Incident model provider call failed (%s). Using fallback plan generator.", exc)
-        return generate_fallback_plan(body), "fallback-model"
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+        LOGGER.warning("Incident model provider response did not match expected shape: %s", exc)
+        raise HTTPException(
+            status_code=502,
+            detail="Incident model provider response did not match the expected JSON format.",
+        ) from exc
+
+    if not isinstance(plan, dict):
+        raise HTTPException(status_code=502, detail="Incident diagnosis model returned an invalid plan.")
+    return plan, model
 
 
 def validate_schema(value: Any, schema: dict[str, Any], path: str) -> None:
@@ -500,9 +437,7 @@ def validate_incident_request(body: dict[str, Any]) -> None:
         raise HTTPException(status_code=422, detail="Invalid tool catalog.")
 
 
-def set_dispatch_contexts(
-    dispatches: list[dict[str, Any]], trace_id: str
-) -> None:
+def set_dispatch_contexts(dispatches: list[dict[str, Any]], trace_id: str) -> None:
     for dispatch in dispatches:
         client_span_id = new_span_id()
         dispatch["traceparent"] = f"00-{trace_id}-{client_span_id}-01"
@@ -673,11 +608,11 @@ async def create_incident(request: Request):
         or not isinstance(catalog, list)
     ):
         raise HTTPException(status_code=422, detail="Invalid incident request.")
-    
+
     validate_incident_request(body)
     request_hash = hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
 
-    conn = sqlite3.connect(DB_FILE, timeout=60)
+    conn = sqlite3.connect(DB_FILE, timeout=60.0)
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -687,8 +622,6 @@ async def create_incident(request: Request):
             if row[0] != request_hash:
                 raise HTTPException(status_code=409, detail="Run identifier conflicts with existing content.")
             return json.loads(row[1])
-
-        from starlette.concurrency import run_in_threadpool
 
         agent_start_ns = time.time_ns()
         model_start_ns = time.time_ns()
@@ -876,7 +809,7 @@ async def process_receipt(runId: str, request: Request):
     receipt_id = body["receiptId"]
     receipt_hash = hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
 
-    conn = sqlite3.connect(DB_FILE, timeout=60)
+    conn = sqlite3.connect(DB_FILE, timeout=60.0)
     try:
         conn.execute("BEGIN IMMEDIATE")
         replay = conn.execute(
@@ -1093,7 +1026,7 @@ async def process_receipt(runId: str, request: Request):
 
 @app.get("/v2/incidents/{runId}")
 async def get_incident_status(runId: str):
-    conn = sqlite3.connect(DB_FILE, timeout=30.0)
+    conn = sqlite3.connect(DB_FILE, timeout=60.0)
     try:
         row = conn.execute(
             "SELECT current_response FROM runs WHERE run_id = ?", (runId,)
